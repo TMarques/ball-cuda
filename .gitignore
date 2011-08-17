@@ -1,0 +1,8 @@
+*dump
+*tar.bz2
+*.txt
+*.log
+**/main
+gmon.out
+main
+main.linkinfo
