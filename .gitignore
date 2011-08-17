@@ -1,8 +1,10 @@
 *dump
 *tar.bz2
-*.txt
 *.log
+*.csv
+*.txt
 **/main
+cuda_prof*
 gmon.out
 main
 main.linkinfo

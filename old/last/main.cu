@@ -4,17 +4,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "/home/tmarques/cuda/include/cuda.h"
-#include "/home/tmarques/cuda/include/cuda_runtime.h"
 //#include "/home/tmarques/NVIDIA_CUDA_SDK/common/inc/cutil.h"
 
 //VERSION NOTES:
-// There's a bug in kernels, should be:
-//  i+1, i-1, i+Nx, i-Nx, i+Nxy, i-Nxy but is 
-//  i+1, i-1, i+Ny, i-Ny, i+Nyz, i-Nyz
-// Which still works fine for square matrices.
-//
-// Texture memory version for T matrix
-
+// First version that runs well with 
+// split T & phi matrices.
+// CalcCP and residual calculation unoptimized
 
 /** Return values:
  * 0 - OK
@@ -22,94 +17,175 @@
  * 2 - Can't allocate CPUMEM for matrix
  * 3 - Can't allocate GPUMEM for matrix
  * 4 - Matrix coordinates can't exceed 512
- * 5 - Invalid texture binding
  */
-
-void checkCUDAError(const char *msg)
-{
-    cudaError_t err = cudaGetLastError();
-
-    if( cudaSuccess != err)
-    {
-        fprintf(stderr, "%s: %s.\n", msg, cudaGetErrorString( err) );
-        exit(EXIT_FAILURE);
-    }
-}
-
-//Texture references must be declared globally:
-texture<float, 1, cudaReadModeElementType> T_texture;
 
 int dumpMemToFile(char *file, void *input, int size);
 
-__global__ void calcCP(float *phi, float *Q, int *charged_points, int number_of_charged_points, float omega)
-{    
-    int *charge_pointer = charged_points+blockIdx.x;
-    
-    phi[*charge_pointer] += omega * Q[*charge_pointer];
+int splitT( float *T, float *T_white, float *T_black, int Nx, int Ny, int Nz )
+{
+    int i, black = 0, white = 0;
+    int x, y, z, incr;
+    //FIXME: Move to GPU, use OpenMP for these cycles?
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                T_white[white] = T[i*6];
+                T_white[white+1] = T[i*6+1];
+                T_white[white+2] = T[i*6+2];
+                T_white[white+3] = T[i*6+3];
+                T_white[white+4] = T[i*6+4];
+                T_white[white+5] = T[i*6+5];
+                white+=6;
+            }
+        }
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = 1 - ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                T_black[black] = T[i*6];
+                T_black[black+1] = T[i*6+1];
+                T_black[black+2] = T[i*6+2];
+                T_black[black+3] = T[i*6+3];
+                T_black[black+4] = T[i*6+4];
+                T_black[black+5] = T[i*6+5];
+                black+=6;
+            }
+        }
+    return 0;
 }
 
-__global__ void blackSOR(float *phi, float omega, float lambda)
+int splitPhi( float *phi, float *phi_white, float *phi_black, int Nx, int Ny, int Nz )
+{
+    int i, black = 0, white = 0;
+    int x, y, z, incr;
+    //FIXME: Move to GPU, use OpenMP for these cycles?
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                phi_white[white]=phi[ i ];
+                white++;
+            }
+        }
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = 1 - ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                phi_black[black]=phi[ i ];
+                black++;
+            }
+        }
+    return 0;
+}
+
+int joinPhi( float *phi, float *phi_white, float *phi_black, int Nx, int Ny, int Nz )
+{
+    int i, black = 0, white = 0;
+    int x, y, z, incr;
+    //FIXME: Move to GPU, use OpenMP for these cycles?
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                phi[i]=phi_white[white];
+                white++;
+            }
+        }
+    for ( z = 0; z < Nz; z++ )
+        for ( y = 0; y < Ny; y++ )
+        {
+            incr = 1 - ( ( y % 2 ) + ( z % 2 ) ) % 2;
+            for ( x = incr; x < Nx; x+=2 )
+            {
+                i = y * Nx + z * Nx * Ny + x;
+                phi[i]=phi_black[black];
+                black++;
+            }
+        }
+    return 0;
+}
+
+__global__ void calcCP(float *phi_half, float *Q, int *charged_points, float omega)
+{    
+    int cp = *(charged_points+blockIdx.x);
+    phi_half[ cp / 2 + cp % 1 ] += omega * Q[cp];
+}
+
+__global__ void blackSOR( float *phi_black, float *phi_white, float *T, float omega, float lambda )
 {
     //FIXME: Check if using "i" is faster than recalculating it's value
     // Use block.Idx.x as 'y', blockIdx.y as 'z' and threadIdx.x as 'x'
-    
+
     // We don't calculate the border values.
-    if ( ! ( ( ( blockIdx.x == 0 ) || ( blockIdx.y == 0 ) || ( threadIdx.x == 0 ) ) 
-          || ( blockIdx.x == 127 ) || ( blockIdx.y == 127 ) || ( threadIdx.x == 127 ) ) )
+    if ( ! ( ( ( blockIdx.x == 0 ) || ( blockIdx.y == 0 ) ) 
+                || ( blockIdx.x == (gridDim.x - 1) ) || ( blockIdx.y == (gridDim.y - 1) ) ) )
     {
-        unsigned int incr = ( ( ( blockIdx.x % 2 ) + ( blockIdx.y % 2 ) ) % 2 );
+        unsigned int incr = 1 - ( ( ( blockIdx.x % 2 ) + ( blockIdx.y % 2 ) ) % 2 );
         // Black?
-        if ( ( threadIdx.x % 2 )  != incr )
+        if ( threadIdx.x != ( incr * ( blockDim.x - 1 ) ) )
         {
             unsigned int i = blockIdx.x * blockDim.x + blockIdx.y * blockDim.x * gridDim.x + threadIdx.x;
-            float T1 = tex1Dfetch( T_texture, ( 6*i ) ),
-                  T2 = tex1Dfetch( T_texture, ( 6*i+1 ) ),
-                  T3 = tex1Dfetch( T_texture, ( 6*i+2 ) ),
-                  T4 = tex1Dfetch( T_texture, ( 6*i+3 ) ),
-                  T5 = tex1Dfetch( T_texture, ( 6*i+4 ) ),
-                  T6 = tex1Dfetch( T_texture, ( 6*i+5 ) );
-            
-            phi[i] = omega * (
-                  T1 * phi[i + 1 ] 
-                + T2 * phi[i - 1 ] 
-                + T3 * phi[i + gridDim.x ]
-                + T4 * phi[i - gridDim.x ]
-                + T5 * phi[i + gridDim.x * gridDim.y ]
-                + T6 * phi[i - gridDim.x * gridDim.y ])
-                + lambda * phi[i];
+//            printf("%d, %d, %d: %lf %lf %lf %lf %lf %lf\n", 
+//                        threadIdx.x, blockIdx.x, blockIdx.y, T[ 6 * i ], T[ 6 * i+1 ], T[ 6 * i+2 ], T[ 6 * i+3 ], T[ 6 * i+4 ], T[ 6 * i+5 ]);
+            phi_black[i] = omega * (
+                    T[ 6 * i ] * phi_white[ i + incr ] 
+                    + T[ 6 * i + 1 ] * phi_white[ i - 1 + incr ] 
+                    + T[ 6 * i + 2 ] * phi_white[ i + blockDim.x ]
+                    + T[ 6 * i + 3 ] * phi_white[ i - blockDim.x ]
+                    + T[ 6 * i + 4 ] * phi_white[ i + blockDim.x * gridDim.x ]
+                    + T[ 6 * i + 5 ] * phi_white[ i - blockDim.x * gridDim.x ])
+                + lambda * phi_black[i];
+
+/*        if ( i == 1956154 )
+                printf("%d, %d, %d: %.40f\n, 
+                        T: %.40f\n,%.40f\n,%.40f\n,%.40f\n,%.40f\n,%.40f\n
+                        phi: ,%.40f\n,%.40f\n,%.40f\n,%.40f\n,%.40f\n,%.40f\n",
+                      threadIdx.x, blockIdx.x, blockIdx.y, phi_black[i],
+                      T[ 6 * i ],  T[ 6 * i + 1 ], T[ 6 * i + 2 ], T[ 6 * i + 3 ], T[ 6 * i + 4 ], T[ 6 * i + 5 ], 
+                      phi_white[ i - 1 + incr ], phi_white[ i + blockDim.x ], phi_white[ i - blockDim.x ], );*/
         }
     }
 }
 
-__global__ void redSOR(float *phi, float omega, float lambda)
+__global__ void whiteSOR( float *phi_white, float *phi_black, float *T, float omega, float lambda )
 {
     //FIXME: Check if using "i" is faster than recalculating it's value
     // Use block.Idx.x as 'y', blockIdx.y as 'z' and threadIdx.x as 'x'
 
     // We don't calculate the border values
-    if  ( ! ( ( blockIdx.x == 0 ) || ( blockIdx.y == 0 ) || ( threadIdx.x == 0 )
-       || ( blockIdx.x == 127 ) || ( blockIdx.y == 127 ) || ( threadIdx.x == 127 ) ) )
+    if ( ! ( ( ( blockIdx.x == 0 ) || ( blockIdx.y == 0 ) ) 
+                || ( blockIdx.x == (gridDim.x - 1) ) || ( blockIdx.y == (gridDim.y - 1) ) ) )
     {
-        unsigned int incr = 1 - ( ( ( blockIdx.x % 2 ) + ( blockIdx.y % 2 ) ) % 2 );
-        // Red?
-        if ( (  threadIdx.x % 2 ) != incr )
+        unsigned int incr = ( ( ( blockIdx.x % 2 ) + ( blockIdx.y % 2 ) ) % 2 );
+        // White?
+        if (  threadIdx.x != ( incr * ( blockDim.x - 1 ) ) )
         {
             unsigned int i = blockIdx.x * blockDim.x + blockIdx.y * blockDim.x * gridDim.x + threadIdx.x;
-            float T1 = tex1Dfetch( T_texture, 6*i ),
-                  T2 = tex1Dfetch( T_texture, ( 6*i+1 ) ),
-                  T3 = tex1Dfetch( T_texture, ( 6*i+2 ) ),
-                  T4 = tex1Dfetch( T_texture, ( 6*i+3 ) ),
-                  T5 = tex1Dfetch( T_texture, ( 6*i+4 ) ),
-                  T6 = tex1Dfetch( T_texture, ( 6*i+5 ) );
-
-            phi[i] = omega * (
-                  T1 * phi[i + 1 ] 
-                + T2 * phi[i - 1 ] 
-                + T3 * phi[i + gridDim.x ]
-                + T4 * phi[i - gridDim.x ]
-                + T5 * phi[i + gridDim.x * gridDim.y ]
-                + T6 * phi[i - gridDim.x * gridDim.y ])
-                + lambda * phi[i];
+            phi_white[i] = omega * (
+                    T[ 6 * i  ] * phi_black[ i + incr ] 
+                    + T[ 6 * i + 1 ] * phi_black[ i - 1 + incr ] 
+                    + T[ 6 * i + 2 ] * phi_black[ i + blockDim.x ]
+                    + T[ 6 * i + 3 ] * phi_black[ i - blockDim.x ]
+                    + T[ 6 * i + 4 ] * phi_black[ i + blockDim.x * gridDim.x ]
+                    + T[ 6 * i + 5 ] * phi_black[ i - blockDim.x * gridDim.x ])
+                + lambda * phi_white[i];
+        //    printf("WTF? %d: %.20f\n", i, phi_white[i]);
         }
     }
 }
@@ -127,49 +203,121 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
     float spectral_radius=0.99969899654388427734375;
 
     int number_of_charged_black_points = 5330, number_of_charged_white_points = 5340;
-    
+
     int Nx = size[0], Ny = size[1], Nz = size[2];
     int Nxy = Nx * Ny;
     int N = Nxy * Nz;
 
     int Msize = size[0]*size[1]*size[2];
 
-    float *phi;
-    if ( cudaMalloc((void **) &phi, sizeof(float)*Msize) 
-            == cudaErrorMemoryAllocation )
+    //Setup CUDA kernel parameters
+    if ( ( Nz > 512 ) || ( Ny > 512 ) || ( Nx > 1024 ) )
     {
-        fprintf(stderr, "Can't allocate GPUMEM for phi matrix.\n");
-        return 3;
+        printf("Matrix size is too large, must be less than 512\n");
+        return 4;
     }
-    cudaMemcpy(phi, phi_host, sizeof(float)*Msize, cudaMemcpyHostToDevice);
-    
-    float *T;
-    if ( cudaMalloc ( (void **) &T, sizeof(float)*6*Msize ) 
-            == cudaErrorMemoryAllocation )
-    {
-        fprintf(stderr, "Can't allocate GPUMEM for T matrix.\n");
-        return 3;
-    }
-    cudaMemcpy( T, T_host, sizeof(float)*6*Msize, cudaMemcpyHostToDevice );
+    //Only 2D grids supported at this time
+    dim3 gridSize( Ny, Nz, 1 );
+    dim3 blockSize( (Nx / 2 ), 1, 1 );
+    dim3 gridSizeCP( Ny, Nz, 1 );
+    dim3 blockSizeCP( (Nx ), 1, 1 );
+    //End setup
 
-    //FIXME: Watch out for size limits for textures(2^27)
-    int textureError = cudaBindTexture( 0, T_texture, T, (sizeof(float)*Msize*6 ) );
-    if ( textureError != cudaSuccess )
+    //Check for number_of_charged_***_points
+    //to be less than ~2^16:
+    if ( ( number_of_charged_black_points > 65530 ) || ( number_of_charged_white_points > 65530 ) )
     {
-        if ( textureError == cudaErrorInvalidTexture )
-        {
-            printf("Error, invalid T texture.\n");
-            return 5;
-        } else if ( textureError == cudaErrorInvalidValue )
-        {
-            printf("Error, invalid value!\n");
-            return 5;
-        } else
-        {
-            printf("Undefined error in T_texture binding.\n");
-            return 5;
-        }
+        printf("One of charged points is too big, must be less than 65500.\n");
+        printf("This is a shortcoming of naively implemented code, please address if necessary.\n");
+        return 5;
     }
+
+    // Split grid into black and white grids:
+    float *phi_black;
+    if ( cudaMalloc((void **) &phi_black, sizeof(float)*( Msize/2 )) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate GPUMEM for phi_black matrix.\n");
+        return 3;
+    }
+    float *phi_white;
+    if ( cudaMalloc((void **) &phi_white, sizeof(float)* ( Msize/2 ) ) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate GPUMEM for phi_white matrix.\n");
+        return 3;
+    }
+    float *phi_black_host;
+    if ( cudaMallocHost((void **) &phi_black_host, sizeof(float)*( Msize/2 )) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for phi_black matrix.\n");
+        return 3;
+    }
+    float *phi_white_host;
+    if ( cudaMallocHost((void **) &phi_white_host, sizeof(float)*( Msize/2 )) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for phi_white matrix.\n");
+        return 3;
+    }
+
+    splitPhi ( phi_host, phi_white_host, phi_black_host, Nx, Ny, Nz );
+//    joinPhi ( phi_host, phi_black_host, phi_white_host, Msize );
+//    dumpMemToFile( "Phi-rejoined.dump", phi_host, Msize*sizeof(float) );
+//    cudaFree(phi_host);
+
+    cudaMemcpy(phi_black, phi_black_host, sizeof(float)*( Msize/2 ), cudaMemcpyHostToDevice);
+    cudaMemcpy(phi_white, phi_white_host, sizeof(float)*( Msize/2 ), cudaMemcpyHostToDevice);
+
+    float *tmp_phi_black_host;
+    if ( cudaMallocHost((void **) &tmp_phi_black_host, sizeof(float)*( Msize/2 )) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for tmp_phi_black matrix.\n");
+        return 3;
+    }
+    float *tmp_phi_white_host;
+    if ( cudaMallocHost((void **) &tmp_phi_white_host, sizeof(float)*( Msize/2 )) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for tmp_phi_white matrix.\n");
+        return 3;
+    }
+
+    float *T_white;
+    if ( cudaMalloc( (void **) &T_white, (sizeof(float)*3*Msize) ) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate GPUMEM for T_white matrix.\n");
+        return 3;
+    }
+    float *T_black;
+    if ( cudaMalloc( (void **) &T_black, (sizeof(float)*3*Msize) ) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate GPUMEM for T_black matrix.\n");
+        return 3;
+    }
+    float *T_white_host;
+    if ( cudaMallocHost( (void **) &T_white_host, (sizeof(float)*3*Msize) ) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for T_white_host matrix.\n");
+        return 3;
+    }
+    float *T_black_host;
+    if ( cudaMallocHost( (void **) &T_black_host, (sizeof(float)*3*Msize) ) 
+            == cudaErrorMemoryAllocation )
+    {
+        fprintf(stderr, "Can't allocate CPUMEM for T_black_host matrix.\n");
+        return 3;
+    }
+    splitT( T_host, T_white_host, T_black_host, size[0], size[1], size[2] );
+    cudaMemcpy( T_white, T_white_host, (sizeof(float)*3*Msize), cudaMemcpyHostToDevice );
+    cudaMemcpy( T_black, T_black_host, (sizeof(float)*3*Msize), cudaMemcpyHostToDevice );
+    cudaFreeHost( T_black_host );
+    cudaFreeHost( T_white_host );
 
     float *tmp_phi_host;
     if ( cudaMallocHost( (void **) &tmp_phi_host, (sizeof(float)*Msize) ) 
@@ -187,7 +335,7 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
         return 3;
     }
     cudaMemcpy( Q, Q_host, (sizeof(float)*Msize), cudaMemcpyHostToDevice );
-   
+
     int *charged_black_points;
     if ( cudaMalloc( (void **) &charged_black_points, (sizeof(int)*number_of_charged_black_points) )
             == cudaErrorMemoryAllocation )
@@ -205,41 +353,35 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
         return 3;
     }
     cudaMemcpy( charged_white_points, CWPoints_host, (sizeof(int)*number_of_charged_white_points), cudaMemcpyHostToDevice );
- 
 
-    //Setup CUDA kernel parameters
-    if ( Nz > 512 )
-    {
-        printf("Matrix size is too large, must be less than 512\n");
-        return 4; 
-    }
-    //Only 2D grids supported at this time
-    dim3 gridSize( Nx, Ny, 1 );
-    dim3 blockSize( Nz, 1, 1 );
-    //End setup
-
-    //Check for number_of_charged_***_points
-    //to be less than ~2^16:
-    if ( ( number_of_charged_black_points > 65530 ) || ( number_of_charged_white_points > 65530 ) )
-    {
-        printf("One of charged points is too big, must be less than 65500.\n");
-        printf("This is a shortcoming of naively implemented code, please address if necessary.\n");
-        return 5;
-    }
+    // FIXME: Not needed?
     cudaThreadSynchronize();
 
     //BALL_START
     float omega = 1, lambda = 1 - omega;
-    
+
     //dumpMemToFile("output.dump", phi_host, sizeof(float)*Msize);
 
-    while ((iteration < max_iterations)  && ((max_residual > max_criterion) || (rms_change > rms_criterion)))
+    while ( (iteration < max_iterations)  && ((max_residual > max_criterion) || (rms_change > rms_criterion)) )
     {
 
         // first half of Gauss-Seidel iteration (black fields only)
-        blackSOR<<< gridSize, blockSize >>> ( phi, omega, lambda );
+        blackSOR<<< gridSize, blockSize >>> ( phi_black, phi_white, T_black, omega, lambda );
         cudaThreadSynchronize();
-        calcCP<<< number_of_charged_black_points, 1 >>> ( phi, Q, charged_black_points, number_of_charged_black_points, omega );
+/*    printf("iteration: %d\n", iteration);
+    if (iteration == 4 )
+    {
+        cudaMemcpy( phi_black_host, phi_black, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+        cudaMemcpy( phi_white_host, phi_white, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+        int teste;
+        joinPhi( phi_host, phi_white_host, phi_black_host,  Nx, Ny, Nz);
+        for (teste = 0; teste < Msize; teste++)
+            printf("%d: %.40f\n", teste, phi_host[teste]);
+
+        //dumpMemToFile( "Phi-run@65.dump", phi_host, Msize*sizeof(float) );
+        return 0;
+    }*/
+        calcCP<<< number_of_charged_black_points, 1 >>> ( phi_black, Q, charged_black_points, omega );
         cudaThreadSynchronize();
 
         // Chebyshev acceleration: omega approaches its
@@ -257,11 +399,11 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
             }
             lambda = 1 - omega;
         }
- 
-        // second half of Gauss-Seidel iteration (red fields only)
-        redSOR<<< gridSize, blockSize >>> ( phi, omega, lambda );
+
+        // second half of Gauss-Seidel iteration (white fields only)
+        whiteSOR<<< gridSize, blockSize >>> ( phi_white, phi_black, T_white, omega, lambda );
         cudaThreadSynchronize();
-        calcCP<<< number_of_charged_white_points, 1 >>> ( phi, Q, charged_white_points, number_of_charged_white_points, omega );
+        calcCP<<< number_of_charged_white_points, 1 >>> ( phi_white, Q, charged_white_points, omega );
         cudaThreadSynchronize();
 
         // Chebyshev acceleration for the second Gauss-Seidel step
@@ -274,14 +416,32 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
         // calculate the gradient every check_after_iterations
         if ((iteration % check_after_iterations) == 0)
         {  
-            cudaMemcpy( phi_host, phi, sizeof(float)*Msize, cudaMemcpyDeviceToHost );
             if (iteration > 0)
             {
+                //FIXME: Both these copies can be done right after kernel execution, and "tmp" also can.
+                cudaMemcpy( phi_black_host, phi_black, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+                cudaMemcpy( phi_white_host, phi_white, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+                joinPhi( phi_host, phi_white_host, phi_black_host,  Nx, Ny, Nz);
+
                 max_residual = 0;
                 residual_norm2 = 0;
 
                 // sum up all squared changes in the phi array since
                 // the last iteration
+/*                for (i = 1; i < ( (N/2) ); i++)
+                {
+                    residual = fabs(tmp_phi_white_host[i] - phi_white_host[i]);
+                    if (max_residual < residual)
+                        max_residual=residual;
+                    residual_norm2 += residual * residual;
+                }
+                for (i = 0; i < ( (N/2) - 1 ); i++)
+                {
+                    residual = fabs(tmp_phi_black_host[i] - phi_black_host[i]);
+                    if (max_residual < residual)
+                        max_residual=residual;
+                    residual_norm2 += residual * residual;
+                }*/
                 for (i = 1; i < (N - 1); i++)
                 {
                     residual = fabs(tmp_phi_host[i] - phi_host[i]);
@@ -289,6 +449,7 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
                         max_residual=residual;
                     residual_norm2 += residual * residual;
                 }
+
                 printf("Res_norm2: %.20f\n", residual_norm2);
                 rms_change = sqrt(residual_norm2 / (float)N);
                 printf("Max Residual = %.20f\n", max_residual);
@@ -299,8 +460,9 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
         if (((iteration + 1) % check_after_iterations) == 0)
         {
             // save the actual settings phi
-            cudaMemcpy( phi_host, phi, sizeof(float)*Msize, cudaMemcpyDeviceToHost );
-            memcpy( tmp_phi_host, phi_host, (Msize * sizeof(float)) );
+            cudaMemcpy( tmp_phi_black_host, phi_black, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+            cudaMemcpy( tmp_phi_white_host, phi_white, sizeof(float)*( Msize/2 ), cudaMemcpyDeviceToHost );
+            joinPhi(tmp_phi_host, tmp_phi_white_host, tmp_phi_black_host, size[0], size[1], size[2] );
         }
 
         if ( (iteration % 10) == 0)
@@ -319,16 +481,19 @@ int doSOR (int *size, float *phi_host, float *T_host, float *Q_host, int *CBPoin
     {
         printf("Not converged - iteration: %d\n", iteration);
     }
-    
-    cudaFree(T);
-    cudaUnbindTexture(T_texture);
-    cudaFree(phi);
-//    cudaFree(T);
+
+    //FIXME: must free after rejoin
+    cudaFree(phi_black);
+    cudaFree(phi_white);
+    cudaFreeHost(phi_black_host);
+    cudaFreeHost(phi_white_host);
+    cudaFreeHost(tmp_phi_black_host);
+    cudaFreeHost(tmp_phi_white_host);
     cudaFree(Q);
     cudaFree(charged_black_points);
     cudaFree(charged_white_points);
     cudaFreeHost(tmp_phi_host);
-    checkCUDAError("CUDA free");
+//    cudaFreeHost(phi_host);
 
     return 0;
 }
@@ -365,19 +530,19 @@ int dumpMemToFile(char *file, void *input, int size)
 }
 
 /*int checkConvergence(float rms_change, float max_residual, int iteration)
-{
-    float rms_criterion = 1e-6F, max_criterion = 1e-6F;
+  {
+  float rms_criterion = 1e-6F, max_criterion = 1e-6F;
 
-    if ((rms_change <= rms_criterion) && (max_residual <= max_criterion))
-    {
-        printf("Converged after %d iterations.\n", iteration);
-    }
-    else
-    {
-        printf("Not converged! (after %d iterations.\n)", iteration);
-    }
-    return 0;
-}*/
+  if ((rms_change <= rms_criterion) && (max_residual <= max_criterion))
+  {
+  printf("Converged after %d iterations.\n", iteration);
+  }
+  else
+  {
+  printf("Not converged! (after %d iterations.\n)", iteration);
+  }
+  return 0;
+  }*/
 
 int main(void)
 {
@@ -394,7 +559,7 @@ int main(void)
         return 2;    
     }
     loadMemFromFile( "Phi.dump", phi, (sizeof(float)*Msize) );
-    
+
     //FIXME: Check for allocation Errors
     float *Tmatrix;
     cudaMallocHost((void **) &Tmatrix, (sizeof(float)*6*Msize) );    
@@ -426,9 +591,8 @@ int main(void)
     //printf("%.20f - %.20f, %d\n", *rms_change, *max_residual, *num_iteration);
     //checkConvergence(*rms_change, *max_residual, *num_iteration);
 
-    int sorError = doSOR(size, phi, Tmatrix, Qmatrix, CBPoints, CWPoints);
-    if ( sorError == 0 )
-        printf("Finished doSOR.\n");
+    doSOR(size, phi, Tmatrix, Qmatrix, CBPoints, CWPoints);
+    printf("Finished doSOR.\n");
 
     cudaFreeHost(phi);
     cudaFreeHost(Tmatrix);
