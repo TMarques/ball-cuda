@@ -505,7 +505,7 @@ int loadMemFromFile(char *file, void *output, int size)
     fRead = open(file, O_RDONLY);
     if ( fRead == -1 )
     {
-        printf("Error opening %s file.\n", size);
+        printf("Error opening %s file.\n", file);
         return 1;
     }
 

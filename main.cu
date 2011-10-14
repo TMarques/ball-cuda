@@ -31,7 +31,7 @@ typedef struct
     int *CWPoints;
     int threadNum;
     int deviceCount;
-} doSORarg_t;
+} DoSORArg;
 
 //First include the texture reference,declared globally:
 texture<float, 1, cudaReadModeElementType> phi_texture;
@@ -54,8 +54,7 @@ __global__ void calcCP( float *phi, float *Q, int *charged_points, int number_of
     }
 }
 
-    __global__ void
-blackSOR(float *phi, float *T, float omega, float lambda, int start, int end)
+__global__ void blackSOR(float *phi, float *T, float omega, float lambda, int start, int end)
 {
     //FIXME: Check if using "i" is faster than recalculating it's value
     // Use block.Idx.x as 'y', blockIdx.y as 'z' and threadIdx.x as 'x'
@@ -93,8 +92,7 @@ blackSOR(float *phi, float *T, float omega, float lambda, int start, int end)
         }
 }
 
-    __global__ void
-whiteSOR(float *phi, float *T, float omega, float lambda, int start, int end)
+__global__ void whiteSOR(float *phi, float *T, float omega, float lambda, int start, int end)
 {
     //FIXME: Check if using "i" is faster than recalculating it's value
     // Use block.Idx.x as 'y', blockIdx.y as 'z' and threadIdx.x as 'x'
@@ -132,10 +130,9 @@ whiteSOR(float *phi, float *T, float omega, float lambda, int start, int end)
         }
 }
 
-void  *doSOR ( void *doSORarg )
+void *doSOR ( void *do_SOR_arg )
 {
-
-    doSORarg_t *host = ( doSORarg_t * ) doSORarg;
+    DoSORArg *host = ( DoSORArg * ) do_SOR_arg;
 
     //    printf( "%i\n", host->threadNum );
     //    pthread_cancel( pthread_self() );
@@ -488,7 +485,7 @@ void  *doSOR ( void *doSORarg )
     cudaFree(charged_white_points);
     cudaFreeHost(tmp_phi_host);
 
-    //return 0;
+    return 0;
 }
 
 int loadMemFromFile(char *file, void *output, int size)
@@ -498,7 +495,7 @@ int loadMemFromFile(char *file, void *output, int size)
     fRead = open(file, O_RDONLY);
     if ( fRead == -1 )
     {
-        printf("Error opening %s file.\n", size);
+        printf( "Error opening %s file.\n", file );
         return 1;
     }
 
@@ -537,7 +534,7 @@ int dumpMemToFile(char *file, void *input, int size)
   return 0;
   }*/
 
-int main(void)
+int main( void )
 {  
 
     int size[3] = {128, 128, 128};
@@ -594,11 +591,11 @@ int main(void)
     {
         pthread_t thread1, thread2;
 
-        doSORarg_t doSORarg  = { size, phi, T, Q, CBPoints, CWPoints, 1, deviceCount };
-        doSORarg_t doSORarg2 = { size, phi, T, Q, CBPoints, CWPoints, 2, deviceCount };
+        DoSORArg do_SOR_arg  = { size, phi, T, Q, CBPoints, CWPoints, 1, deviceCount };
+        DoSORArg do_SOR_arg2 = { size, phi, T, Q, CBPoints, CWPoints, 2, deviceCount };
 
-        int threadRtn1 = pthread_create( &thread1, NULL, doSOR, (void *) &doSORarg );
-        int threadRtn2 = pthread_create( &thread2, NULL, doSOR, (void *) &doSORarg2 );
+        int threadRtn1 = pthread_create( &thread1, NULL, doSOR, (void *) &do_SOR_arg );
+        int threadRtn2 = pthread_create( &thread2, NULL, doSOR, (void *) &do_SOR_arg2 );
 
         pthread_join( thread1, NULL);
         pthread_join( thread2, NULL);

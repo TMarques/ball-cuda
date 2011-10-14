@@ -3,7 +3,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "/home/cudauser/cuda/include/cuda.h"
+#include "/home/tmarques/cuda/include/cuda.h"
 
 
 /** Return values:
